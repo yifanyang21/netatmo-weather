@@ -1,40 +1,61 @@
 #!/usr/bin/env python3
 """
-Netatmo Netherlands Weather Data Collector with Tile System
-使用分 tile 方式下载整个荷兰的数据
+Netatmo 三大城市数据采集器 (Utrecht, Amsterdam, Rotterdam)
+用于 GitHub Actions 自动化运行
 """
 
 import os
 import sys
-import json
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import math
 
 # -----------------------------
 # 配置
 # -----------------------------
 
+# 从环境变量读取凭证
 CLIENT_ID = os.environ.get("NETATMO_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("NETATMO_CLIENT_SECRET")
 REFRESH_TOKEN = os.environ.get("NETATMO_REFRESH_TOKEN")
 
 if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-    print("❌ 错误：缺少必要的环境变量")
+    print("错误：缺少必要的环境变量")
+    print("请在 GitHub Secrets 中配置：")
+    print("  - NETATMO_CLIENT_ID")
+    print("  - NETATMO_CLIENT_SECRET")
+    print("  - NETATMO_REFRESH_TOKEN")
     sys.exit(1)
 
-# 荷兰边界
-NL_BOUNDS = {
-    "lat_max": 53.6,
-    "lat_min": 50.7,
-    "lon_max": 7.3,
-    "lon_min": 3.2,
+# 定义三大城市的区域
+CITIES = {
+    "utrecht": {
+        "name": "Utrecht",
+        "center_lat": 52.0908,
+        "center_lon": 5.1222,
+        "radius_km": 10,
+    },
+    "amsterdam": {
+        "name": "Amsterdam",
+        "center_lat": 52.3676,
+        "center_lon": 4.9041,
+        "radius_km": 15,
+    },
+    "rotterdam": {
+        "name": "Rotterdam",
+        "center_lat": 51.9225,
+        "center_lon": 4.4792,
+        "radius_km": 15,
+    },
 }
 
-# Tile 划分：4×3 网格 = 12 个 tile
-NUM_ROWS = 3    # 南北方向分 3 块
-NUM_COLS = 4    # 东西方向分 4 块
+# 每个城市分成多少个 tiles
+TILES_PER_CITY = {
+    "rows": 2,
+    "cols": 2,
+}
 
 # API 端点
 TOKEN_URL = "https://api.netatmo.com/oauth2/token"
@@ -43,53 +64,15 @@ GETPUBLICDATA_URL = "https://api.netatmo.com/api/getpublicdata"
 # 数据保存目录
 DATA_DIR = "data"
 
-# 每个 tile 之间的延迟（避免 API 限流）
-DELAY_BETWEEN_TILES = 2  # 秒
+# 请求间隔
+DELAY_BETWEEN_TILES = 2
+
+# 阿姆斯特丹时区偏移（冬季 UTC+1）
+AMSTERDAM_OFFSET = timedelta(hours=1)
 
 # -----------------------------
-# 函数
+# 函数定义
 # -----------------------------
-
-def generate_tiles(bounds, num_rows, num_cols):
-    """
-    生成 tile 列表
-    
-    返回格式：
-    [
-        {"id": "T1", "lat_ne": ..., "lon_ne": ..., "lat_sw": ..., "lon_sw": ...},
-        {"id": "T2", ...},
-        ...
-    ]
-    """
-    lat_step = (bounds["lat_max"] - bounds["lat_min"]) / num_rows
-    lon_step = (bounds["lon_max"] - bounds["lon_min"]) / num_cols
-    
-    tiles = []
-    tile_id = 1
-    
-    # 从北到南（lat 从大到小）
-    for row in range(num_rows):
-        lat_ne = bounds["lat_max"] - row * lat_step
-        lat_sw = lat_ne - lat_step
-        
-        # 从西到东（lon 从小到大）
-        for col in range(num_cols):
-            lon_sw = bounds["lon_min"] + col * lon_step
-            lon_ne = lon_sw + lon_step
-            
-            tiles.append({
-                "id": f"T{tile_id}",
-                "row": row,
-                "col": col,
-                "lat_ne": round(lat_ne, 4),
-                "lon_ne": round(lon_ne, 4),
-                "lat_sw": round(lat_sw, 4),
-                "lon_sw": round(lon_sw, 4),
-            })
-            tile_id += 1
-    
-    return tiles
-
 
 def refresh_access_token(refresh_token):
     """使用 refresh_token 获取新的 access_token"""
@@ -104,8 +87,59 @@ def refresh_access_token(refresh_token):
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"❌ Token 刷新失败: {e}")
+        print(f"Token 刷新失败: {e}")
         sys.exit(1)
+
+
+def km_to_degrees(km, latitude):
+    """将公里转换为经纬度度数"""
+    lat_degree = km / 111.0
+    lon_degree = km / (111.0 * math.cos(math.radians(latitude)))
+    return lat_degree, lon_degree
+
+
+def generate_city_tiles(city_config, num_rows, num_cols):
+    """为单个城市生成 tiles"""
+    center_lat = city_config["center_lat"]
+    center_lon = city_config["center_lon"]
+    radius_km = city_config["radius_km"]
+    
+    lat_delta, lon_delta = km_to_degrees(radius_km, center_lat)
+    
+    bounds = {
+        "lat_max": center_lat + lat_delta,
+        "lat_min": center_lat - lat_delta,
+        "lon_max": center_lon + lon_delta,
+        "lon_min": center_lon - lon_delta,
+    }
+    
+    lat_step = (bounds["lat_max"] - bounds["lat_min"]) / num_rows
+    lon_step = (bounds["lon_max"] - bounds["lon_min"]) / num_cols
+    
+    tiles = []
+    tile_id = 1
+    
+    for row in range(num_rows):
+        lat_ne = bounds["lat_max"] - row * lat_step
+        lat_sw = lat_ne - lat_step
+        
+        for col in range(num_cols):
+            lon_sw = bounds["lon_min"] + col * lon_step
+            lon_ne = lon_sw + lon_step
+            
+            tiles.append({
+                "id": f"{city_config['name']}_T{tile_id}",
+                "city": city_config["name"],
+                "row": row,
+                "col": col,
+                "lat_ne": round(lat_ne, 4),
+                "lon_ne": round(lon_ne, 4),
+                "lat_sw": round(lat_sw, 4),
+                "lon_sw": round(lon_sw, 4),
+            })
+            tile_id += 1
+    
+    return tiles
 
 
 def get_public_data(access_token, region):
@@ -119,19 +153,20 @@ def get_public_data(access_token, region):
         "required_data": "temperature",
         "filter": "true",
     }
+    
     try:
         r = requests.post(GETPUBLICDATA_URL, headers=headers, data=payload, timeout=60)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.HTTPError as e:
-        print(f"⚠️  HTTP 错误: {e}")
+        print(f"HTTP 错误: {e}")
         return {"body": []}
     except Exception as e:
-        print(f"⚠️  请求失败: {e}")
+        print(f"请求失败: {e}")
         return {"body": []}
 
 
-def parse_public_data(public_json, tile_id):
+def parse_public_data(public_json, tile_info):
     """解析 API 返回的数据为 DataFrame"""
     body = public_json.get("body", [])
     rows = []
@@ -160,16 +195,25 @@ def parse_public_data(public_json, tile_id):
                 except Exception:
                     pass
             
+            # 时间转换
+            if latest_ts:
+                time_utc = datetime.fromtimestamp(latest_ts, tz=timezone.utc)
+                time_amsterdam = time_utc + AMSTERDAM_OFFSET
+                timestamp_amsterdam = time_amsterdam.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                timestamp_amsterdam = None
+            
             location = place.get("location", [None, None])
             rows.append({
-                "tile_id": tile_id,
+                "city_area": tile_info["city"],
+                "tile_id": tile_info["id"],
                 "device_id": dev_id,
-                "timestamp_utc": datetime.fromtimestamp(latest_ts, tz=timezone.utc).isoformat() if latest_ts else None,
+                "timestamp_amsterdam": timestamp_amsterdam,
                 "temperature_c": latest_temp,
                 "latitude": location[1] if isinstance(location, list) and len(location) > 1 else None,
                 "longitude": location[0] if isinstance(location, list) and len(location) > 0 else None,
                 "altitude_m": place.get("altitude"),
-                "city": place.get("city"),
+                "location_name": place.get("city"),
                 "country": place.get("country"),
             })
     
@@ -184,26 +228,13 @@ def parse_public_data(public_json, tile_id):
 
 def download_tile(access_token, tile):
     """下载单个 tile 的数据"""
-    print(f"\n  📍 Tile {tile['id']} ({tile['lat_sw']:.2f}°N-{tile['lat_ne']:.2f}°N, "
-          f"{tile['lon_sw']:.2f}°E-{tile['lon_ne']:.2f}°E)")
-    
-    # 获取数据
     public_json = get_public_data(access_token, tile)
     device_count = len(public_json.get("body", []))
     
     if device_count == 0:
-        print(f"     ⚠️  无数据")
         return pd.DataFrame()
     
-    # 解析数据
-    df = parse_public_data(public_json, tile["id"])
-    
-    if len(df) > 0:
-        avg_temp = df['temperature_c'].mean()
-        print(f"     ✅ {len(df)} 个站点，平均温度 {avg_temp:.1f}°C")
-    else:
-        print(f"     ⚠️  解析后无有效数据")
-    
+    df = parse_public_data(public_json, tile)
     return df
 
 
@@ -211,7 +242,7 @@ def save_data(df, timestamp):
     """保存数据到 CSV"""
     os.makedirs(DATA_DIR, exist_ok=True)
     
-    filename = f"{DATA_DIR}/netherlands_weather_{timestamp}.csv"
+    filename = f"{DATA_DIR}/3cities_weather_{timestamp}.csv"
     df.to_csv(filename, index=False, encoding="utf-8")
     
     return filename
@@ -223,7 +254,7 @@ def save_data(df, timestamp):
 
 def main():
     print("=" * 70)
-    print("🌡️  Netatmo 荷兰全境温度数据采集 (Tile System)")
+    print("Netatmo 三大城市温度数据采集")
     print("=" * 70)
     
     start_time = time.time()
@@ -231,75 +262,99 @@ def main():
     timestamp = now.strftime('%Y%m%d_%H%M')
     
     print(f"运行时间: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"Tile 配置: {NUM_ROWS}×{NUM_COLS} = {NUM_ROWS * NUM_COLS} 个 tiles")
+    print(f"城市: Utrecht, Amsterdam, Rotterdam")
+    print(f"Tile 配置: {TILES_PER_CITY['rows']}×{TILES_PER_CITY['cols']} 每城市")
     
-    # 1. 生成 tiles
-    print("\n1️⃣ 生成 Tile 网格...")
-    tiles = generate_tiles(NL_BOUNDS, NUM_ROWS, NUM_COLS)
-    print(f"   ✅ 已生成 {len(tiles)} 个 tiles")
-    
-    # 2. 刷新 token
-    print("\n2️⃣ 刷新访问令牌...")
+    # 1. 刷新 token
+    print("\n 1 刷新访问令牌...")
     tokens = refresh_access_token(REFRESH_TOKEN)
     access_token = tokens["access_token"]
-    print("   ✅ Token 刷新成功")
+    print("   Token 刷新成功")
     
-    # 3. 下载每个 tile
-    print(f"\n3️⃣ 开始下载数据（每个 tile 间隔 {DELAY_BETWEEN_TILES}s）...")
+    # 2. 生成所有城市的 tiles
+    print("\n 2 生成 Tile 网格...")
+    all_tiles = []
+    for city_key, city_config in CITIES.items():
+        tiles = generate_city_tiles(
+            city_config,
+            TILES_PER_CITY["rows"],
+            TILES_PER_CITY["cols"]
+        )
+        all_tiles.extend(tiles)
+        print(f"   {city_config['name']:12s}: {len(tiles)} tiles")
+    
+    print(f"   总计: {len(all_tiles)} tiles")
+    
+    # 3. 下载数据
+    print(f"\n 3 开始下载数据（每个 tile 间隔 {DELAY_BETWEEN_TILES}s）...")
     
     all_data = []
+    city_stats = {city["name"]: 0 for city in CITIES.values()}
     successful_tiles = 0
     failed_tiles = 0
     
-    for i, tile in enumerate(tiles, 1):
-        print(f"\n  [{i}/{len(tiles)}]", end="")
+    for i, tile in enumerate(all_tiles, 1):
+        city_name = tile["city"]
+        print(f"\n  [{i}/{len(all_tiles)}] {tile['id']}", end="")
         
         try:
             df = download_tile(access_token, tile)
+            
             if len(df) > 0:
                 all_data.append(df)
+                city_stats[city_name] += len(df)
                 successful_tiles += 1
+                avg_temp = df['temperature_c'].mean()
+                print(f" {len(df)} 站点，平均 {avg_temp:.1f}°C")
+            else:
+                print(f" 无数据")
             
-            # 延迟（最后一个 tile 不需要延迟）
-            if i < len(tiles):
+            if i < len(all_tiles):
                 time.sleep(DELAY_BETWEEN_TILES)
         
         except Exception as e:
-            print(f"     ❌ 错误: {e}")
+            print(f" 错误: {e}")
             failed_tiles += 1
             continue
     
     # 4. 合并数据
-    print(f"\n4️⃣ 合并数据...")
+    print(f"\n 4 合并数据...")
     
     if len(all_data) == 0:
-        print("   ❌ 没有任何有效数据")
+        print("  没有任何有效数据")
         sys.exit(1)
     
     df_combined = pd.concat(all_data, ignore_index=True)
-    
-    # 去除可能的跨 tile 重复设备
     df_combined = df_combined.drop_duplicates(subset=["device_id"])
     
-    print(f"   ✅ 合并完成：共 {len(df_combined)} 个唯一天气站")
+    print(f"   合并完成：共 {len(df_combined)} 个唯一天气站")
     
     # 5. 保存数据
-    print(f"\n5️⃣ 保存数据...")
+    print(f"\n 5 保存数据...")
     filename = save_data(df_combined, timestamp)
     
     # 6. 统计信息
     elapsed = time.time() - start_time
-    avg_temp = df_combined['temperature_c'].mean()
     
     print("\n" + "=" * 70)
-    print("✅ 任务完成")
+    print("任务完成")
     print("=" * 70)
-    print(f"成功 tiles: {successful_tiles}/{len(tiles)}")
-    print(f"失败 tiles: {failed_tiles}/{len(tiles)}")
-    print(f"总天气站: {len(df_combined)}")
-    print(f"平均温度: {avg_temp:.1f}°C")
+    print(f"成功 tiles: {successful_tiles}/{len(all_tiles)}")
+    print(f"失败 tiles: {failed_tiles}/{len(all_tiles)}")
+    print()
+    
+    for city_name in ["Utrecht", "Amsterdam", "Rotterdam"]:
+        city_data = df_combined[df_combined['city_area'] == city_name]
+        if len(city_data) > 0:
+            avg_temp = city_data['temperature_c'].mean()
+            print(f"{city_name:15s}: {len(city_data):4d} 站点，平均温度 {avg_temp:.1f}°C")
+        else:
+            print(f"{city_name:15s}: 无数据")
+    
+    print()
+    print(f"总站点数: {len(df_combined)}")
     print(f"数据文件: {filename}")
-    print(f"耗时: {elapsed:.1f} 秒")
+    print(f"总耗时: {elapsed:.1f} 秒")
     print("=" * 70)
 
 
